@@ -1,0 +1,6 @@
+# 忽略所有 PyTorch 模型权重文件
+*.pth
+
+# 忽略实验生成的日志和中间权重
+experiments/
+checkpoints/
