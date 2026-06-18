@@ -1,19 +1,22 @@
 # ====== 官方框架必需的全局训练参数 ======
 total_bs: 16
 step_per_update: 1
-max_epoch: 150 # 工业零件重构较难，建议 100-200 epoch
+# 【修改点 1】：因为改为局部切块训练，模型需要看更多的块才能覆盖全域，建议将 epoch 翻倍
+max_epoch: 300 
 
 optimizer:
   type: AdamW
   kwargs:
-    lr: 0.001
-    weight_decay: 0.05
+    lr: 0.00005
+    weight_decay: 0.01
 
 scheduler:
   type: CosLR
   kwargs:
-    epochs: 150
-    initial_epochs: 10
+    # 【修改点 2】：余弦退火的周期必须与 max_epoch 严格对齐
+    epochs: 300
+    # 适当拉长 warmup 周期，让模型在致密块上更稳定地启动
+    initial_epochs: 20
 
 # ====== 数据集嵌套结构 ======
 dataset:
@@ -25,6 +28,7 @@ dataset:
       CATEGORY: capsule
       MODE: train
       LEVEL: ALL
+      # 训练集：每次截取 16384 个致密局部点
       N_POINTS: 16384
       subset: train
   val:
@@ -35,6 +39,7 @@ dataset:
       CATEGORY: capsule
       MODE: test
       LEVEL: ALL
+      # 测试集：这其实是个占位符，Dataset 里遇到 test 会自动跳过截断，读取全量 50万点
       N_POINTS: 500000
       subset: test
 
@@ -50,6 +55,7 @@ model:
     depth: 12
     drop_path_rate: 0.1
     encoder_dims: 384
-    mask_ratio: 0.6 
+    # 掩码率保持 0.6 是个不错的 baseline。如果重建太模糊，未来可以尝试降到 0.5
+    mask_ratio: 0.4 
     mask_type: rand
     decoder_depth: 4

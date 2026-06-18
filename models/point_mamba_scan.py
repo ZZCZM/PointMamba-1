@@ -28,6 +28,30 @@ from .build import MODELS
 from .serialization import Point
 
 
+# =====================================================================
+# 【新增】：原生的 PyTorch 最远点采样 (FPS) 函数，无需额外编译 CUDA
+# =====================================================================
+def fps(xyz, npoint):
+    """
+    xyz: (B, N, 3)
+    npoint: 采样的目标点数
+    """
+    device = xyz.device
+    B, N, C = xyz.shape
+    centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
+    distance = torch.ones(B, N, device=device) * 1e10
+    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
+    batch_indices = torch.arange(B, dtype=torch.long, device=device)
+    for i in range(npoint):
+        centroids[:, i] = farthest
+        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
+        dist = torch.sum((xyz - centroid) ** 2, -1)
+        mask = dist < distance
+        distance[mask] = dist[mask]
+        farthest = torch.max(distance, -1)[1]
+    return centroids
+
+
 class Encoder(nn.Module):  ## Embedding module
     def __init__(self, encoder_channel):
         super().__init__()
@@ -46,23 +70,17 @@ class Encoder(nn.Module):  ## Embedding module
         )
 
     def forward(self, point_groups):
-        '''
-            point_groups : B G N 3
-            -----------------
-            feature_global : B G C
-        '''
         bs, g, n, _ = point_groups.shape
         point_groups = point_groups.reshape(bs * g, n, 3)
-        # encoder
-        feature = self.first_conv(point_groups.transpose(2, 1))  # BG 256 n
-        feature_global = torch.max(feature, dim=2, keepdim=True)[0]  # BG 256 1
-        feature = torch.cat([feature_global.expand(-1, -1, n), feature], dim=1)  # BG 512 n
-        feature = self.second_conv(feature)  # BG 1024 n
-        feature_global = torch.max(feature, dim=2, keepdim=False)[0]  # BG 1024
+        feature = self.first_conv(point_groups.transpose(2, 1))  
+        feature_global = torch.max(feature, dim=2, keepdim=True)[0]  
+        feature = torch.cat([feature_global.expand(-1, -1, n), feature], dim=1)  
+        feature = self.second_conv(feature)  
+        feature_global = torch.max(feature, dim=2, keepdim=False)[0]  
         return feature_global.reshape(bs, g, self.encoder_channel)
 
 
-class Group(nn.Module):  # Random Sampling + KNN (Modified for Anomaly Detection)
+class Group(nn.Module):  
     def __init__(self, num_group, group_size):
         super().__init__()
         self.num_group = num_group
@@ -70,18 +88,14 @@ class Group(nn.Module):  # Random Sampling + KNN (Modified for Anomaly Detection
         self.knn = KNN(k=self.group_size, transpose_mode=True)
 
     def forward(self, xyz):
-        '''
-            input: B N 3
-            ---------------------------
-            output: B G M 3
-            center : B G 3
-        '''
         batch_size, num_points, _ = xyz.shape
         
-        # 【修改点 1】: 使用随机采样替代 O(N^2) 复杂度的 FPS
-        # 能够处理海量点云并防止微小的异常点（如划痕/凸起）被均匀化抹除
-        rand_indices = torch.randperm(num_points, device=xyz.device)[:self.num_group]
-        center = xyz[:, rand_indices, :]  # B G 3
+        # 【修改点 1】: 恢复使用 FPS 替代随机采样
+        # 外部 runner 已经改用 Block Cropping 切块（通常仅 1.6 万点），不会引发 OOM。
+        # FPS 能确保局部块内的种子点均匀分布，极大地保留了几何流形拓扑，避免异常区域特征丢失。
+        fps_idx = fps(xyz, self.num_group)
+        batch_indices = torch.arange(batch_size, dtype=torch.long, device=xyz.device).unsqueeze(-1)
+        center = xyz[batch_indices, fps_idx, :]  # B G 3
 
         # knn to get the neighborhood
         _, idx = self.knn(xyz, center)  # B G M
@@ -92,19 +106,13 @@ class Group(nn.Module):  # Random Sampling + KNN (Modified for Anomaly Detection
         idx = idx.view(-1)
         neighborhood = xyz.view(batch_size * num_points, -1)[idx, :]
         neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3).contiguous()
+        
         # normalize
         neighborhood = neighborhood - center.unsqueeze(2)
         return neighborhood, center
 
 
-# https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
-def _init_weights(
-        module,
-        n_layer,
-        initializer_range=0.02,  # Now only used for embedding layer.
-        rescale_prenorm_residual=True,
-        n_residuals_per_layer=1,  # Change to 2 if we have MLP
-):
+def _init_weights(module, n_layer, initializer_range=0.02, rescale_prenorm_residual=True, n_residuals_per_layer=1):
     if isinstance(module, nn.Linear):
         if module.bias is not None:
             if not getattr(module.bias, "_no_reinit", False):
@@ -150,54 +158,22 @@ def serialization(pos, feat=None, x_res=None, order="z", layers_outputs=[], grid
     return pos, order, inverse_order, feat, x_res
 
 
-def create_block(
-        d_model,
-        ssm_cfg=None,
-        norm_epsilon=1e-5,
-        rms_norm=False,
-        residual_in_fp32=False,
-        fused_add_norm=False,
-        layer_idx=None,
-        drop_path=0.,
-        device=None,
-        dtype=None,
-):
+def create_block(d_model, ssm_cfg=None, norm_epsilon=1e-5, rms_norm=False, residual_in_fp32=False, fused_add_norm=False, layer_idx=None, drop_path=0., device=None, dtype=None):
     if ssm_cfg is None:
         ssm_cfg = {}
     factory_kwargs = {"device": device, "dtype": dtype}
 
     mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
-    norm_cls = partial(
-        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
-    )
+    norm_cls = partial(nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs)
     block = Block(
-        d_model,
-        mixer_cls,
-        norm_cls=norm_cls,
-        fused_add_norm=fused_add_norm,
-        residual_in_fp32=residual_in_fp32,
-        drop_path=drop_path,
+        d_model, mixer_cls, norm_cls=norm_cls, fused_add_norm=fused_add_norm, residual_in_fp32=residual_in_fp32, drop_path=drop_path,
     )
     block.layer_idx = layer_idx
     return block
 
 
 class MixerModel(nn.Module):
-    def __init__(
-            self,
-            d_model: int,
-            n_layer: int,
-            ssm_cfg=None,
-            norm_epsilon: float = 1e-5,
-            rms_norm: bool = False,
-            initializer_cfg=None,
-            fused_add_norm=False,
-            residual_in_fp32=False,
-            drop_out: int = 0.,
-            drop_path=0.,
-            device=None,
-            dtype=None,
-    ) -> None:
+    def __init__(self, d_model: int, n_layer: int, ssm_cfg=None, norm_epsilon: float = 1e-5, rms_norm: bool = False, initializer_cfg=None, fused_add_norm=False, residual_in_fp32=False, drop_out: int = 0., drop_path=0., device=None, dtype=None) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
@@ -209,31 +185,15 @@ class MixerModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 create_block(
-                    d_model,
-                    ssm_cfg=ssm_cfg,
-                    norm_epsilon=norm_epsilon,
-                    rms_norm=rms_norm,
-                    residual_in_fp32=residual_in_fp32,
-                    fused_add_norm=fused_add_norm,
-                    layer_idx=i,
-                    drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                    **factory_kwargs,
+                    d_model, ssm_cfg=ssm_cfg, norm_epsilon=norm_epsilon, rms_norm=rms_norm, residual_in_fp32=residual_in_fp32, fused_add_norm=fused_add_norm, layer_idx=i, drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, **factory_kwargs,
                 )
                 for i in range(n_layer)
             ]
         )
 
-        self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
-            d_model, eps=norm_epsilon, **factory_kwargs
-        )
+        self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(d_model, eps=norm_epsilon, **factory_kwargs)
 
-        self.apply(
-            partial(
-                _init_weights,
-                n_layer=n_layer,
-                **(initializer_cfg if initializer_cfg is not None else {}),
-            )
-        )
+        self.apply(partial(_init_weights, n_layer=n_layer, **(initializer_cfg if initializer_cfg is not None else {})))
         self.drop_out = nn.Dropout(drop_out) if drop_out > 0. else nn.Identity()
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
@@ -244,15 +204,10 @@ class MixerModel(nn.Module):
 
     def forward(self, input_ids, pos, inference_params=None):
         hidden_states = input_ids + pos
-
         for layer in self.layers:
-            hidden_states = layer(
-                hidden_states, inference_params=inference_params
-            )
+            hidden_states = layer(hidden_states, inference_params=inference_params)
             hidden_states = self.drop_out(hidden_states)
-
         hidden_states = self.norm_f(hidden_states.to(dtype=self.norm_f.weight.dtype))
-
         return hidden_states
 
 
@@ -261,17 +216,14 @@ class PointMambaScan(nn.Module):
     def __init__(self, config, **kwargs):
         super(PointMambaScan, self).__init__()
         self.config = config
-
         self.trans_dim = config.trans_dim
         self.depth = config.depth
         self.cls_dim = config.cls_dim
-
         self.group_size = config.group_size
         self.num_group = config.num_group
         self.encoder_dims = config.encoder_dims
 
         self.group_divider = Group(num_group=self.num_group, group_size=self.group_size)
-
         self.encoder = Encoder(encoder_channel=self.encoder_dims)
 
         self.use_cls_token = False if not hasattr(self.config, "use_cls_token") else self.config.use_cls_token
@@ -289,16 +241,10 @@ class PointMambaScan(nn.Module):
             trunc_normal_(self.cls_pos, std=.02)
 
         self.pos_embed = nn.Sequential(
-            nn.Linear(3, 128),
-            nn.GELU(),
-            nn.Linear(128, self.trans_dim)
+            nn.Linear(3, 128), nn.GELU(), nn.Linear(128, self.trans_dim)
         )
 
-        self.blocks = MixerModel(d_model=self.trans_dim,
-                                 n_layer=self.depth,
-                                 rms_norm=self.rms_norm,
-                                 drop_out=self.drop_out,
-                                 drop_path=dpr)
+        self.blocks = MixerModel(d_model=self.trans_dim, n_layer=self.depth, rms_norm=self.rms_norm, drop_out=self.drop_out, drop_path=dpr)
 
         self.HEAD_CHANEL = 1
         if self.use_cls_token:
@@ -319,7 +265,6 @@ class PointMambaScan(nn.Module):
         )
 
         self.build_loss_func()
-
         self.OrderScale_gamma_1, self.OrderScale_beta_1 = init_OrderScale(self.trans_dim)
         self.OrderScale_gamma_2, self.OrderScale_beta_2 = init_OrderScale(self.trans_dim)
 
@@ -336,7 +281,6 @@ class PointMambaScan(nn.Module):
         if bert_ckpt_path is not None:
             ckpt = torch.load(bert_ckpt_path, map_location='cpu')
             base_ckpt = {k.replace("module.", ""): v for k, v in ckpt['base_model'].items()}
-
             for k in list(base_ckpt.keys()):
                 if k.startswith('MAE_encoder'):
                     base_ckpt[k[len('MAE_encoder.'):]] = base_ckpt[k]
@@ -346,14 +290,6 @@ class PointMambaScan(nn.Module):
                     del base_ckpt[k]
 
             incompatible = self.load_state_dict(base_ckpt, strict=False)
-
-            if incompatible.missing_keys:
-                print_log('missing_keys', logger='Mamba')
-                print_log(get_missing_parameters_message(incompatible.missing_keys), logger='Mamba')
-            if incompatible.unexpected_keys:
-                print_log('unexpected_keys', logger='Mamba')
-                print_log(get_unexpected_parameters_message(incompatible.unexpected_keys), logger='Mamba')
-
             print_log(f'[Mamba] Successful Loading the ckpt from {bert_ckpt_path}', logger='Mamba')
         else:
             print_log('Training from scratch!!!', logger='Mamba')
@@ -374,10 +310,9 @@ class PointMambaScan(nn.Module):
 
     def forward(self, pts):
         neighborhood, center = self.group_divider(pts)
-        group_input_tokens = self.encoder(neighborhood)  # B G N
-        pos = self.pos_embed(center)  # B G C
+        group_input_tokens = self.encoder(neighborhood)  
+        pos = self.pos_embed(center)  
 
-        # reordering strategy
         _, _, _, group_input_tokens_forward, pos_forward = serialization_func(center, group_input_tokens, pos, 'hilbert')
         _, _, _, group_input_tokens_backward, pos_backward = serialization_func(center, group_input_tokens, pos, 'hilbert-trans')
         group_input_tokens_forward = apply_OrderScale(group_input_tokens_forward, self.OrderScale_gamma_1, self.OrderScale_beta_1)
@@ -425,27 +360,20 @@ class MaskMamba(nn.Module):
         self.trans_dim = config.mamba_config.trans_dim
         self.depth = config.mamba_config.depth
         self.drop_path_rate = config.mamba_config.drop_path_rate
-        print_log(f'[args] {config.mamba_config}', logger='Mamba')
         
         self.encoder_dims = config.mamba_config.encoder_dims
         self.encoder = Encoder(encoder_channel=self.encoder_dims)
 
         self.mask_type = config.mamba_config.mask_type
         self.pos_embed = nn.Sequential(
-            nn.Linear(3, 128),
-            nn.GELU(),
-            nn.Linear(128, self.trans_dim),
+            nn.Linear(3, 128), nn.GELU(), nn.Linear(128, self.trans_dim),
         )
         dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.depth)]
 
-        self.blocks = MixerModel(d_model=self.trans_dim,
-                                 n_layer=self.depth,
-                                 rms_norm=self.config.rms_norm,
-                                 drop_path=dpr)
+        self.blocks = MixerModel(d_model=self.trans_dim, n_layer=self.depth, rms_norm=self.config.rms_norm, drop_path=dpr)
 
         self.OrderScale_gamma_1, self.OrderScale_beta_1 = init_OrderScale(self.trans_dim)
         self.OrderScale_gamma_2, self.OrderScale_beta_2 = init_OrderScale(self.trans_dim)
-
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -467,18 +395,17 @@ class MaskMamba(nn.Module):
             
         mask_idx = []
         for points in center:
-            points = points.unsqueeze(0)  # 1 G 3
+            points = points.unsqueeze(0)  
             index = random.randint(0, points.size(1) - 1)
             distance_matrix = torch.norm(points[:, index].reshape(1, 1, 3) - points, p=2, dim=-1)  
-
-            idx = torch.argsort(distance_matrix, dim=-1, descending=False)[0]  # G
+            idx = torch.argsort(distance_matrix, dim=-1, descending=False)[0]  
             ratio = self.mask_ratio
             mask_num = int(ratio * len(idx))
             mask = torch.zeros(len(idx))
             mask[idx[:mask_num]] = 1
             mask_idx.append(mask.bool())
 
-        bool_masked_pos = torch.stack(mask_idx).to(center.device)  # B G
+        bool_masked_pos = torch.stack(mask_idx).to(center.device) 
         return bool_masked_pos
 
     def _mask_center_rand(self, center, noaug=False):
@@ -487,26 +414,21 @@ class MaskMamba(nn.Module):
             return torch.zeros(center.shape[:2]).bool()
 
         self.num_mask = int(self.mask_ratio * G)
-
         overall_mask = np.zeros([B, G])
         for i in range(B):
-            mask = np.hstack([
-                np.zeros(G - self.num_mask),
-                np.ones(self.num_mask),
-            ])
+            mask = np.hstack([np.zeros(G - self.num_mask), np.ones(self.num_mask)])
             np.random.shuffle(mask)
             overall_mask[i, :] = mask
         overall_mask = torch.from_numpy(overall_mask).to(torch.bool)
-
-        return overall_mask.to(center.device)  # B G
+        return overall_mask.to(center.device) 
 
     def forward(self, neighborhood, center, order, order_index, noaug=False):  
         if self.mask_type == 'rand':
-            bool_masked_pos = self._mask_center_rand(center, noaug=noaug)  # B G
+            bool_masked_pos = self._mask_center_rand(center, noaug=noaug)  
         else:
             bool_masked_pos = self._mask_center_block(center, noaug=noaug)
 
-        group_input_tokens = self.encoder(neighborhood)  # B G C
+        group_input_tokens = self.encoder(neighborhood)  
 
         if order_index == 0:
             group_input_tokens = apply_OrderScale(group_input_tokens, self.OrderScale_gamma_1, self.OrderScale_beta_1)
@@ -518,25 +440,18 @@ class MaskMamba(nn.Module):
         batch_size, seq_len, C = group_input_tokens.size()
         
         x_vis = group_input_tokens[~bool_masked_pos].reshape(batch_size, -1, C)
-        
         masked_center = center[~bool_masked_pos].reshape(batch_size, -1, 3)
         pos = self.pos_embed(masked_center)
 
         x_vis = self.blocks(x_vis, pos)
-
         return x_vis, bool_masked_pos, group_input_tokens
 
 
 class MambaDecoder(nn.Module):
     def __init__(self, embed_dim=384, depth=4, norm_layer=nn.LayerNorm, drop_path=0, config=None):
         super().__init__()
-
-        self.blocks = MixerModel(d_model=embed_dim,
-                                 n_layer=depth,
-                                 rms_norm=config.rms_norm,
-                                 drop_path=drop_path)
+        self.blocks = MixerModel(d_model=embed_dim, n_layer=depth, rms_norm=config.rms_norm, drop_path=drop_path)
         self.head = nn.Identity()
-
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -552,7 +467,7 @@ class MambaDecoder(nn.Module):
         B, _, C = x.shape
         x = self.blocks(x, pos)
         
-        # 【修改点 2】: 针对异常检测全域流形比对的要求，取消截取mask部分
+        # 针对异常检测全域流形比对的要求，取消截取mask部分
         # 返回所有 tokens (包含 vis 和 mask 区域)，进行全局的三维重建
         x = self.head(x) 
         return x
@@ -562,7 +477,6 @@ class MambaDecoder(nn.Module):
 class Point_MAE_Mamba_serializationV2(nn.Module):
     def __init__(self, config):
         super().__init__()
-        print_log(f'[PointMamba] ', logger='PointMamba')
         self.config = config
         self.trans_dim = config.mamba_config.trans_dim
         self.MAE_encoder = MaskMamba(config)
@@ -570,9 +484,7 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         self.num_group = config.num_group
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.trans_dim))
         self.decoder_pos_embed = nn.Sequential(
-            nn.Linear(3, 128),
-            nn.GELU(),
-            nn.Linear(128, self.trans_dim)
+            nn.Linear(3, 128), nn.GELU(), nn.Linear(128, self.trans_dim)
         )
 
         self.decoder_depth = config.mamba_config.decoder_depth
@@ -580,13 +492,9 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.decoder_depth)]
 
         self.MAE_decoder = MambaDecoder(
-            embed_dim=self.trans_dim,
-            depth=self.decoder_depth,
-            drop_path=dpr,
-            config=config,
+            embed_dim=self.trans_dim, depth=self.decoder_depth, drop_path=dpr, config=config,
         )
 
-        print_log(f'[PointMamba] divide point cloud into G{self.num_group} x S{self.group_size} points ...', logger='PointMamba')
         self.group_divider = Group(num_group=self.num_group, group_size=self.group_size)
 
         # prediction head
@@ -616,8 +524,8 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         center, order, index_order, _, _ = serialization_func(center, None, None, order_list[order_index[0]])
         neighborhood = neighborhood.flatten(0, 1)[order].reshape(B, G, S, -1).contiguous()
 
-        x_vis, mask, group_input_tokens = self.MAE_encoder(neighborhood, center, order=order, order_index=order_index[0])
-        B, _, C = x_vis.shape  # B VIS C
+        x_vis, mask, group_input_tokens = self.MAE_encoder(neighborhood, center, order=order, order_index=order_index[0], noaug=(mode=='test'))
+        B, _, C = x_vis.shape  
 
         pos_emd_vis = self.decoder_pos_embed(center[~mask]).reshape(B, -1, C)
         pos_emd_mask = self.decoder_pos_embed(center[mask]).reshape(B, -1, C)
@@ -631,8 +539,7 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
 
         x_rec = self.MAE_decoder(x_full, pos_full, mask)
 
-        # 【修改点 3】: 将网络改为重建所有 patch（全局重建），并恢复绝对坐标用于比对。
-        # 这里 x_rec 现在的形状是 [B, G, C] (因为 MambaDecoder 放行了所有 tokens)
+        # 全局重建，并恢复绝对坐标用于比对
         B, G_out, C = x_rec.shape 
         rebuild_points = self.increase_dim(x_rec.transpose(1, 2)).transpose(1, 2).reshape(B * G_out, -1, 3) 
 
@@ -643,14 +550,21 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         rebuild_points_abs = rebuild_points + center_expanded
         gt_points_abs = gt_points + center_expanded
 
+        # =========================================================================
+        # 【改进点 2：计算点偏移量 (Point Offsets)】
+        # 我们让模型内部保持对坐标的绝对流形重构，防止 MAE 架构出现恒等映射泄漏。
+        # 随后，显式计算“重建的正常坐标”与“原始输入坐标”之间的差值即为 Point Offsets
+        # =========================================================================
+        predicted_offsets = rebuild_points_abs - gt_points_abs
+
         if mode == 'train':
-            # 训练阶段: 在纯正常的点云上使用全局倒角距离（Chamfer Distance）进行优化
+            # 训练阶段: 在纯正常的点云上使用倒角距离（Chamfer Distance）进行流形逼近
             loss1 = self.loss_func(rebuild_points_abs, gt_points_abs)
             return loss1
         else:
-            # 推理阶段: 抛弃 Loss，直接返回原始绝对坐标和重建出来的正常流形绝对坐标
-            # (方便在上游调用该模块后，使用 KNN 距离等计算出详细的 point-wise anomaly score)
-            return gt_points_abs, rebuild_points_abs
+            # 推理阶段: 抛弃 Loss，直接返回原始绝对坐标、重建绝对坐标，以及【最重要的偏移向量】
+            # 这个 offsets 返回后，可以直接用 torch.norm(offsets, p=2, dim=-1) 作为异常热力图分数！
+            return gt_points_abs, rebuild_points_abs, predicted_offsets
 
 
 def init_OrderScale(dim):
